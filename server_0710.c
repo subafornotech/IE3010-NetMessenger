@@ -179,7 +179,37 @@ void cmd_list(client_t *c) {
     reply(c, "OK USERS %s", out);
 }
 
-/* ================= dispatcher ================= */
+  void cmd_bcast(client_t *c, char *msg) {
+    if (!*msg) { reply(c, "ERR 008 MISSING_ARGUMENT"); return; }
+    char line[BUF_SIZE + 64];
+    snprintf(line, sizeof line, "MSG BCAST %s %s\n", c->name, msg);
+    send_to_all_except(c, line);          /* everyone except the sender */
+    reply(c, "OK SENT");
+    log_event("BCAST %s: %s", c->name, msg);
+}
+
+void cmd_pmsg(client_t *c, char *args) {
+    char target[NAME_LEN];
+    int off = 0;
+    /* %31s reads the target name; " %n" skips spaces and records where the message starts */
+    if (sscanf(args, "%31s %n", target, &off) != 1 || args[off] == '\0') {
+        reply(c, "ERR 008 MISSING_ARGUMENT");
+        return;
+    }
+    char *msg = args + off;
+
+    char line[BUF_SIZE + 64];
+    snprintf(line, sizeof line, "MSG PRIV %s %s\n", c->name, msg);
+
+    pthread_mutex_lock(&state_lock);
+    client_t *t = find_user(target);
+    if (t) deliver(t, line);              /* send while the lock keeps t valid */
+    pthread_mutex_unlock(&state_lock);
+
+    if (!t) { reply(c, "ERR 002 USER_NOT_FOUND"); return; }
+    reply(c, "OK SENT");
+    log_event("PMSG %s -> %s: %s", c->name, target, msg);
+}/* ================= dispatcher ================= */
 
 /* Returns -1 when the connection should close (QUIT), otherwise 0. */
 int handle_command(client_t *c, char *line) {
@@ -198,7 +228,11 @@ int handle_command(client_t *c, char *line) {
         return 0;
     }
 
+    //if (!strcmp(cmd, "LIST")) cmd_list(c);
+    //else reply(c, "ERR 007 UNKNOWN_COMMAND");
     if (!strcmp(cmd, "LIST")) cmd_list(c);
+    else if (!strcmp(cmd, "BCAST")) cmd_bcast(c, args);
+    else if (!strcmp(cmd, "PMSG"))  cmd_pmsg(c, args);
     else reply(c, "ERR 007 UNKNOWN_COMMAND");
     return 0;
 }
