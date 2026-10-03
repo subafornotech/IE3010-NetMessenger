@@ -1,0 +1,16 @@
+CC     = gcc
+CFLAGS = -Wall -Wextra -g -pthread
+ID     = 0710
+
+all: server_$(ID) client_$(ID)
+
+server_$(ID): server_$(ID).c
+	$(CC) $(CFLAGS) -o $@ $<
+
+client_$(ID): client_$(ID).c
+	$(CC) $(CFLAGS) -o $@ $<
+
+clean:
+	rm -f server_$(ID) client_$(ID)
+
+.PHONY: all clean
