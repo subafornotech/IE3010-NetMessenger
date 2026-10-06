@@ -33,6 +33,8 @@ typedef struct {
     char buf[BUF_SIZE];            /* bytes received but not yet processed */
     size_t len;                    /* how many bytes are in buf */
     pthread_mutex_t send_lock;     /* only one thread writes to this socket at a time */
+    time_t win_start;              /* rate limit: which second we are counting */
+    int    win_count;              /* rate limit: messages sent in that second */
 } client_t;
 
 typedef struct {
@@ -403,6 +405,20 @@ int cmd_sendfile(client_t *c, char *args) {
     return 0;
 }
 
+/* ================= rate limiting (extension) ================= */
+
+#define RATE_MAX 5     /* at most 5 messages per client per second */
+
+/* Fixed one-second window: returns 1 if this message is over the limit. */
+int rate_limited(client_t *c) {
+    time_t now = time(NULL);
+    if (now != c->win_start) {     /* a new second: start counting again */
+        c->win_start = now;
+        c->win_count = 0;
+    }
+    return ++c->win_count > RATE_MAX;
+}
+
 /* ================= dispatcher ================= */
 
 /* Returns -1 when the connection should close (QUIT), otherwise 0. */
@@ -422,6 +438,12 @@ int handle_command(client_t *c, char *line) {
         return 0;
     }
 if (!strcmp(cmd, "SENDFILE")) return cmd_sendfile(c, args);
+if ((!strcmp(cmd, "BCAST") || !strcmp(cmd, "PMSG") || !strcmp(cmd, "RMSG"))
+            && rate_limited(c)) {
+        reply(c, "ERR 015 RATE_LIMITED");
+        log_event("RATE LIMIT %s", c->name);
+        return 0;
+    }
 
     //if (!strcmp(cmd, "LIST")) cmd_list(c);
     //else reply(c, "ERR 007 UNKNOWN_COMMAND");
@@ -453,6 +475,8 @@ void cleanup_client(client_t *c, int graceful) {
     }
     close(c->fd);
     c->name[0] = '\0';
+    c->win_start = 0;
+    c->win_count = 0;
     c->len = 0;
     c->active = 0;                /* slot is free for the next connection */
     pthread_mutex_unlock(&state_lock);
