@@ -209,7 +209,95 @@ void cmd_pmsg(client_t *c, char *args) {
     if (!t) { reply(c, "ERR 002 USER_NOT_FOUND"); return; }
     reply(c, "OK SENT");
     log_event("PMSG %s -> %s: %s", c->name, target, msg);
-}/* ================= dispatcher ================= */
+}
+/* Find a room by name. Call with state_lock held. */
+room_t *find_room(const char *name) {
+    for (int i = 0; i < MAX_ROOMS; i++)
+        if (rooms[i].active && !strcmp(rooms[i].name, name)) return &rooms[i];
+    return NULL;
+}
+
+void cmd_join(client_t *c, char *room) {
+    if (!valid_name(room)) { reply(c, "ERR 014 INVALID_NAME"); return; }
+    pthread_mutex_lock(&state_lock);
+    room_t *r = find_room(room);
+    if (!r) {                                  /* room doesn't exist: create it */
+        for (int i = 0; i < MAX_ROOMS; i++)
+            if (!rooms[i].active) { r = &rooms[i]; break; }
+        if (r) {
+            memset(r, 0, sizeof *r);           /* clear any old members */
+            r->active = 1;
+            strcpy(r->name, room);
+        }
+    }
+    if (r) r->member[slot_of(c)] = 1;
+    pthread_mutex_unlock(&state_lock);
+
+    if (!r) { reply(c, "ERR 013 ROOM_LIMIT_REACHED"); return; }
+    reply(c, "OK JOINED %s", room);
+    log_event("JOIN %s -> %s", c->name, room);
+}
+
+void cmd_leave(client_t *c, char *room) {
+    int s = slot_of(c), result;       /* 0 = no such room, 1 = not a member, 2 = left */
+    pthread_mutex_lock(&state_lock);
+    room_t *r = find_room(room);
+    if (!r) result = 0;
+    else if (!r->member[s]) result = 1;
+    else {
+        r->member[s] = 0;
+        if (room_empty(r)) r->active = 0;   /* last one out deletes the room */
+        result = 2;
+    }
+    pthread_mutex_unlock(&state_lock);
+
+    if (result == 0) reply(c, "ERR 003 ROOM_NOT_FOUND");
+    else if (result == 1) reply(c, "ERR 012 NOT_IN_ROOM");
+    else { reply(c, "OK LEFT %s", room); log_event("LEAVE %s <- %s", c->name, room); }
+}
+
+void cmd_rooms(client_t *c) {
+    char out[BUF_SIZE] = "";
+    pthread_mutex_lock(&state_lock);
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (rooms[i].active) {
+            if (out[0]) strcat(out, ",");
+            strcat(out, rooms[i].name);
+        }
+    }
+    pthread_mutex_unlock(&state_lock);
+    reply(c, "OK ROOMS %s", out);
+}
+
+void cmd_rmsg(client_t *c, char *args) {
+    char room[NAME_LEN];
+    int off = 0;
+    if (sscanf(args, "%31s %n", room, &off) != 1 || args[off] == '\0') {
+        reply(c, "ERR 008 MISSING_ARGUMENT");
+        return;
+    }
+    char *msg = args + off;
+    char line[BUF_SIZE + 64];
+    snprintf(line, sizeof line, "MSG ROOM %s %s %s\n", room, c->name, msg);
+
+    int s = slot_of(c), result;
+    pthread_mutex_lock(&state_lock);
+    room_t *r = find_room(room);
+    if (!r) result = 0;
+    else if (!r->member[s]) result = 1;
+    else {
+        result = 2;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (r->member[i] && i != s) deliver(&clients[i], line);   /* members except sender */
+    }
+    pthread_mutex_unlock(&state_lock);
+
+    if (result == 0) reply(c, "ERR 003 ROOM_NOT_FOUND");
+    else if (result == 1) reply(c, "ERR 012 NOT_IN_ROOM");
+    else { reply(c, "OK SENT"); log_event("RMSG %s -> #%s: %s", c->name, room, msg); }
+}
+
+/* ================= dispatcher ================= */
 
 /* Returns -1 when the connection should close (QUIT), otherwise 0. */
 int handle_command(client_t *c, char *line) {
@@ -233,6 +321,10 @@ int handle_command(client_t *c, char *line) {
     if (!strcmp(cmd, "LIST")) cmd_list(c);
     else if (!strcmp(cmd, "BCAST")) cmd_bcast(c, args);
     else if (!strcmp(cmd, "PMSG"))  cmd_pmsg(c, args);
+    else if (!strcmp(cmd, "JOIN"))  cmd_join(c, args);
+    else if (!strcmp(cmd, "LEAVE")) cmd_leave(c, args);
+    else if (!strcmp(cmd, "ROOMS")) cmd_rooms(c);
+    else if (!strcmp(cmd, "RMSG"))  cmd_rmsg(c, args);
     else reply(c, "ERR 007 UNKNOWN_COMMAND");
     return 0;
 }
