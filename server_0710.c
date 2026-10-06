@@ -181,7 +181,7 @@ void cmd_list(client_t *c) {
     reply(c, "OK USERS %s", out);
 }
 
-  void cmd_bcast(client_t *c, char *msg) {
+void cmd_bcast(client_t *c, char *msg) {
     if (!*msg) { reply(c, "ERR 008 MISSING_ARGUMENT"); return; }
     char line[BUF_SIZE + 64];
     snprintf(line, sizeof line, "MSG BCAST %s %s\n", c->name, msg);
@@ -445,8 +445,6 @@ if ((!strcmp(cmd, "BCAST") || !strcmp(cmd, "PMSG") || !strcmp(cmd, "RMSG"))
         return 0;
     }
 
-    //if (!strcmp(cmd, "LIST")) cmd_list(c);
-    //else reply(c, "ERR 007 UNKNOWN_COMMAND");
     if (!strcmp(cmd, "LIST")) cmd_list(c);
     else if (!strcmp(cmd, "BCAST")) cmd_bcast(c, args);
     else if (!strcmp(cmd, "PMSG"))  cmd_pmsg(c, args);
