@@ -297,6 +297,112 @@ void cmd_rmsg(client_t *c, char *args) {
     else { reply(c, "OK SENT"); log_event("RMSG %s -> #%s: %s", c->name, room, msg); }
 }
 
+/* ================= file transfer ================= */
+
+/* Read exactly n bytes from the client: first what is already in c->buf, then recv() the rest.
+   dst == NULL means read and throw away. Returns 0 on success, -1 if the client disconnected. */
+int read_exact(client_t *c, char *dst, size_t n) {
+    size_t take = c->len < n ? c->len : n;      /* 1. bytes already buffered */
+    if (dst) memcpy(dst, c->buf, take);
+    memmove(c->buf, c->buf + take, c->len - take);
+    c->len -= take;
+
+    size_t got = take;                          /* 2. the rest straight from the socket */
+    char tmp[BUF_SIZE];
+    while (got < n) {
+        size_t want = n - got;
+        char *into = dst ? dst + got : tmp;
+        if (!dst && want > sizeof tmp) want = sizeof tmp;
+        ssize_t r = recv(c->fd, into, want, 0);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return 0;
+}
+
+/* Send the MSG FILE header and the file bytes together, so nothing can land in between. */
+void send_file_to(client_t *t, const char *hdr, size_t hn, const char *data, size_t n) {
+    pthread_mutex_lock(&t->send_lock);
+    send_all(t->fd, hdr, hn);
+    send_all(t->fd, data, n);
+    pthread_mutex_unlock(&t->send_lock);
+}
+
+/* SENDFILE <user|room> <filename> <size>, followed by exactly <size> raw bytes. */
+int cmd_sendfile(client_t *c, char *args) {
+    char target[NAME_LEN], fname[256];
+    long long size;
+    if (sscanf(args, "%31s %255s %lld", target, fname, &size) != 3 || size < 0) {
+        reply(c, "ERR 008 MISSING_ARGUMENT");
+        return 0;
+    }
+    if (size > MAX_FILE) {
+        if (read_exact(c, NULL, size) < 0) return -1;   /* still consume the bytes */
+        reply(c, "ERR 004 FILE_TOO_LARGE");
+        log_event("FILE rejected %s from %s (%lld bytes, too large)", fname, c->name, size);
+        return 0;
+    }
+
+    char *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        if (read_exact(c, NULL, size) < 0) return -1;
+        reply(c, "ERR 004 FILE_TOO_LARGE");
+        return 0;
+    }
+    if (read_exact(c, data, size) < 0) {
+        free(data);
+        log_event("FILE aborted %s from %s (disconnected mid-transfer)", fname, c->name);
+        return -1;
+    }
+
+    if (strchr(fname, '/') || strstr(fname, "..")) {    /* block ../../etc/passwd tricks */
+        free(data);
+        reply(c, "ERR 014 INVALID_NAME");
+        return 0;
+    }
+
+    char hdr[512];
+    int hn = snprintf(hdr, sizeof hdr, "MSG FILE %s %s %lld\n", c->name, fname, size);
+
+    int s = slot_of(c), result = 0;      /* 0 unknown target, 1 user, 2 room, 3 not a member */
+    pthread_mutex_lock(&state_lock);
+    client_t *t = find_user(target);     /* users are checked before rooms */
+    if (t) {
+        send_file_to(t, hdr, hn, data, size);
+        result = 1;
+    } else {
+        room_t *r = find_room(target);
+        if (r && !r->member[s]) result = 3;
+        else if (r) {
+            result = 2;
+            for (int i = 0; i < MAX_CLIENTS; i++)
+                if (r->member[i] && i != s) send_file_to(&clients[i], hdr, hn, data, size);
+        }
+    }
+    pthread_mutex_unlock(&state_lock);
+
+    if (result == 0 || result == 3) {
+        free(data);
+        reply(c, result == 0 ? "ERR 002 USER_NOT_FOUND" : "ERR 012 NOT_IN_ROOM");
+        return 0;
+    }
+
+    /* keep a copy on the server: ./storage/IT23700710/<sender>/<filename> */
+    char dir[256], path[600];
+    mkdir("./storage", 0755);                 /* harmless if it already exists */
+    mkdir("./storage/" REGNO, 0755);
+    snprintf(dir, sizeof dir, "./storage/%s/%s", REGNO, c->name);
+    mkdir(dir, 0755);
+    snprintf(path, sizeof path, "%s/%s", dir, fname);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(data, 1, size, f); fclose(f); }
+    free(data);
+
+    reply(c, "OK FILE_RECEIVED %s", fname);
+    log_event("FILE %s -> %s: %s (%lld bytes) saved to %s", c->name, target, fname, size, path);
+    return 0;
+}
+
 /* ================= dispatcher ================= */
 
 /* Returns -1 when the connection should close (QUIT), otherwise 0. */
@@ -315,6 +421,7 @@ int handle_command(client_t *c, char *line) {
         reply(c, "ERR 006 NOT_REGISTERED");
         return 0;
     }
+if (!strcmp(cmd, "SENDFILE")) return cmd_sendfile(c, args);
 
     //if (!strcmp(cmd, "LIST")) cmd_list(c);
     //else reply(c, "ERR 007 UNKNOWN_COMMAND");
